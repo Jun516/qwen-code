@@ -1,0 +1,87 @@
+name: Verify board PR browser gate in pinned Playwright image
+
+on:
+  push:
+    branches:
+      - verification/board-browser-env-20261026
+
+permissions:
+  contents: read
+
+jobs:
+  browser-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48
+      options: --ipc=host
+    env:
+      CI: 'true'
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - name: Checkout unchanged product head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: 6c3f3208abbc69ff824ef9a03961aa2f6b695444
+          fetch-depth: 1
+      - name: Setup Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Install exact locked workspace and run original prepare build
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = 6c3f3208abbc69ff824ef9a03961aa2f6b695444
+          node --version
+          corepack enable
+          corepack pnpm --version
+          corepack pnpm install --frozen-lockfile --prefer-offline --reporter=append-only
+      - name: Verify pinned Playwright version and existing browser executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import { createRequire } from 'node:module';
+          const rootRequire = createRequire(process.cwd() + '/package.json');
+          const webRequire = createRequire(process.cwd() + '/packages/web-shell/package.json');
+          for (const [name, req] of [['root', rootRequire], ['web-shell', webRequire]]) {
+            const version = req('playwright/package.json').version;
+            if (version !== '1.61.1') throw new Error(`${name} unexpected playwright ${version}`);
+            const { chromium, webkit } = req('playwright');
+            for (const browser of [chromium, webkit]) {
+              const executable = browser.executablePath();
+              console.log(name, version, browser.name(), executable);
+              if (!fs.existsSync(executable)) throw new Error(`Preinstalled browser missing: ${executable}`);
+            }
+          }
+          JS
+      - name: Choose original CI web-shell port
+        shell: bash
+        run: |
+          set -euo pipefail
+          port="$(node -e "const net=require('net');const server=net.createServer();server.listen(0,'127.0.0.1',()=>{console.log(server.address().port);server.close();});")"
+          echo "PLAYWRIGHT_PORT=${port}" >> "$GITHUB_ENV"
+      - name: Run original transcript browser gate
+        timeout-minutes: 4
+        shell: bash
+        run: npx vitest run --root ./integration-tests ./chat-transcript-document.test.ts --retry=0
+      - name: Run original full Web Shell smoke entry
+        timeout-minutes: 9
+        shell: bash
+        run: npm run test:e2e:smoke --workspace=packages/web-shell -- --workers=2
+      - name: Retain actual browser reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: browser-gate-15349
+          path: |
+            packages/web-shell/client/e2e/test-results
+            packages/web-shell/client/e2e/playwright-report
+          retention-days: 7
+          if-no-files-found: ignore
